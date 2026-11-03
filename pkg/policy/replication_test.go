@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	xctx "github.com/clyso/chorus/pkg/ctx"
 	"github.com/clyso/chorus/pkg/dom"
 	"github.com/clyso/chorus/pkg/entity"
 	"github.com/clyso/chorus/pkg/tasks"
@@ -15,12 +16,15 @@ import (
 func Test_AddUserReplicationPolicy(t *testing.T) {
 	c := testutil.SetupRedis(t)
 	type before struct {
-		mainStorage         string
-		routingBlock        *entity.UniversalReplicationID
-		userRepl            *entity.UserReplicationPolicy
-		userReplHasSwitch   bool
-		bucketRepl          *entity.BucketReplicationPolicy
-		bucketReplHasSwitch bool
+		mainStorage                     string
+		routingBlock                    *entity.UniversalReplicationID
+		userRepl                        *entity.UserReplicationPolicy
+		userReplHasSwitch               bool
+		bucketRepl                      *entity.BucketReplicationPolicy
+		bucketReplHasSwitch             bool
+		bucketReplHasZeroDowntimeSwitch bool
+		bucketRoute                     *entity.BucketRoutingPolicyID
+		bucketRouteToStorage            string
 	}
 	tests := []struct {
 		name    string
@@ -119,6 +123,68 @@ func Test_AddUserReplicationPolicy(t *testing.T) {
 				ToStorage:   "follower",
 			},
 			wantErr: dom.ErrInvalidArg,
+		},
+		{
+			name: "err: bucket replication in zero-downtime switch for user",
+			before: before{
+				mainStorage: "main",
+				bucketRepl: &entity.BucketReplicationPolicy{
+					User:        "user",
+					FromStorage: "main",
+					ToStorage:   "follower",
+					FromBucket:  "any",
+					ToBucket:    "any",
+				},
+				bucketReplHasZeroDowntimeSwitch: true,
+			},
+			policy: entity.UserReplicationPolicy{
+				User:        "user",
+				FromStorage: "main",
+				ToStorage:   "follower2",
+			},
+			wantErr: dom.ErrInvalidArg,
+		},
+		{
+			name: "err: user bucket routed to other storage",
+			before: before{
+				mainStorage:          "main",
+				bucketRoute:          &entity.BucketRoutingPolicyID{User: "user", Bucket: "any"},
+				bucketRouteToStorage: "follower2",
+			},
+			policy: entity.UserReplicationPolicy{
+				User:        "user",
+				FromStorage: "main",
+				ToStorage:   "follower",
+			},
+			wantErr: dom.ErrInvalidArg,
+		},
+		{
+			name: "ok: user bucket routed to source storage",
+			before: before{
+				mainStorage:          "main",
+				bucketRoute:          &entity.BucketRoutingPolicyID{User: "user", Bucket: "any"},
+				bucketRouteToStorage: "main",
+			},
+			policy: entity.UserReplicationPolicy{
+				User:        "user",
+				FromStorage: "main",
+				ToStorage:   "follower",
+			},
+			wantErr: nil,
+		},
+		{
+			name: "ok: bucket routed to other storage for different user",
+			before: before{
+				mainStorage:          "main",
+				bucketRoute:          &entity.BucketRoutingPolicyID{User: "user-2", Bucket: "any"},
+				bucketRouteToStorage: "follower2",
+			},
+			policy: entity.UserReplicationPolicy{
+				User:        "user",
+				FromStorage: "main",
+				ToStorage:   "follower",
+			},
+			wantErr: nil,
 		},
 		{
 			name: "ok: bucket replication exists for different user",
@@ -225,7 +291,7 @@ func Test_AddUserReplicationPolicy(t *testing.T) {
 			}
 
 			if tt.before.userRepl != nil {
-				err := svc.AddUserReplicationPolicy(ctx, *tt.before.userRepl, entity.ReplicationOptions{})
+				_, err := svc.AddUserReplicationPolicy(ctx, *tt.before.userRepl, entity.ReplicationOptions{})
 				r.NoError(err)
 				if tt.before.userReplHasSwitch {
 					uid := entity.UniversalFromUserReplication(*tt.before.userRepl)
@@ -234,16 +300,24 @@ func Test_AddUserReplicationPolicy(t *testing.T) {
 				}
 			}
 			if tt.before.bucketRepl != nil {
-				err := svc.AddBucketReplicationPolicy(ctx, *tt.before.bucketRepl, entity.ReplicationOptions{})
+				_, err := svc.AddBucketReplicationPolicy(ctx, *tt.before.bucketRepl, entity.ReplicationOptions{})
 				r.NoError(err)
 				if tt.before.bucketReplHasSwitch {
 					bid := entity.UniversalFromBucketReplication(*tt.before.bucketRepl)
 					err = svc.SetDowntimeReplicationSwitch(ctx, bid, nil)
 					r.NoError(err)
 				}
+				if tt.before.bucketReplHasZeroDowntimeSwitch {
+					startZeroDowntimeSwitch(t, svc, &qs, entity.UniversalFromBucketReplication(*tt.before.bucketRepl))
+				}
 			}
 
-			err := svc.AddUserReplicationPolicy(ctx, tt.policy, entity.ReplicationOptions{})
+			if tt.before.bucketRoute != nil {
+				err := svc.SetBucketRouting(ctx, *tt.before.bucketRoute, tt.before.bucketRouteToStorage)
+				r.NoError(err)
+			}
+
+			_, err := svc.AddUserReplicationPolicy(ctx, tt.policy, entity.ReplicationOptions{})
 			if tt.wantErr != nil {
 				r.ErrorIs(err, tt.wantErr)
 				return
@@ -268,12 +342,13 @@ func Test_AddUserReplicationPolicy(t *testing.T) {
 func Test_AddBucketReplicationPolicy(t *testing.T) {
 	c := testutil.SetupRedis(t)
 	type before struct {
-		mainStorage         string
-		routingBlock        *entity.UniversalReplicationID
-		userRepl            *entity.UserReplicationPolicy
-		userReplHasSwitch   bool
-		bucketRepl          *entity.BucketReplicationPolicy
-		bucketReplHasSwitch bool
+		mainStorage                   string
+		routingBlock                  *entity.UniversalReplicationID
+		userRepl                      *entity.UserReplicationPolicy
+		userReplHasSwitch             bool
+		bucketRepl                    *entity.BucketReplicationPolicy
+		bucketReplHasSwitch           bool
+		userReplHasZeroDowntimeSwitch bool
 	}
 	tests := []struct {
 		name    string
@@ -382,6 +457,26 @@ func Test_AddBucketReplicationPolicy(t *testing.T) {
 				User:        "user",
 				FromStorage: "main",
 				ToStorage:   "follower",
+				FromBucket:  "bucket",
+				ToBucket:    "bucket",
+			},
+			wantErr: dom.ErrInvalidArg,
+		},
+		{
+			name: "err: user replication in zero-downtime switch",
+			before: before{
+				mainStorage: "main",
+				userRepl: &entity.UserReplicationPolicy{
+					User:        "user",
+					FromStorage: "main",
+					ToStorage:   "follower",
+				},
+				userReplHasZeroDowntimeSwitch: true,
+			},
+			policy: entity.BucketReplicationPolicy{
+				User:        "user",
+				FromStorage: "follower",
+				ToStorage:   "follower2",
 				FromBucket:  "bucket",
 				ToBucket:    "bucket",
 			},
@@ -580,16 +675,19 @@ func Test_AddBucketReplicationPolicy(t *testing.T) {
 			}
 
 			if tt.before.userRepl != nil {
-				err := svc.AddUserReplicationPolicy(ctx, *tt.before.userRepl, entity.ReplicationOptions{})
+				_, err := svc.AddUserReplicationPolicy(ctx, *tt.before.userRepl, entity.ReplicationOptions{})
 				r.NoError(err)
 				if tt.before.userReplHasSwitch {
 					uid := entity.UniversalFromUserReplication(*tt.before.userRepl)
 					err = svc.SetDowntimeReplicationSwitch(ctx, uid, nil)
 					r.NoError(err)
 				}
+				if tt.before.userReplHasZeroDowntimeSwitch {
+					startZeroDowntimeSwitch(t, svc, &qs, entity.UniversalFromUserReplication(*tt.before.userRepl))
+				}
 			}
 			if tt.before.bucketRepl != nil {
-				err := svc.AddBucketReplicationPolicy(ctx, *tt.before.bucketRepl, entity.ReplicationOptions{})
+				_, err := svc.AddBucketReplicationPolicy(ctx, *tt.before.bucketRepl, entity.ReplicationOptions{})
 				r.NoError(err)
 				if tt.before.bucketReplHasSwitch {
 					bid := entity.UniversalFromBucketReplication(*tt.before.bucketRepl)
@@ -598,7 +696,7 @@ func Test_AddBucketReplicationPolicy(t *testing.T) {
 				}
 			}
 
-			err := svc.AddBucketReplicationPolicy(ctx, tt.policy, entity.ReplicationOptions{AgentURL: tt.name, EventSource: dom.EventSourceS3Notification})
+			_, err := svc.AddBucketReplicationPolicy(ctx, tt.policy, entity.ReplicationOptions{AgentURL: tt.name, EventSource: dom.EventSourceS3Notification})
 			if tt.wantErr != nil {
 				r.ErrorIs(err, tt.wantErr)
 				return
@@ -648,6 +746,7 @@ func Test_DeleteBucketReplicationPolicy(t *testing.T) {
 		before  before
 		policy  entity.BucketReplicationPolicy
 		wantErr error
+		missing bool
 	}{
 		{
 			name: "ok",
@@ -670,7 +769,7 @@ func Test_DeleteBucketReplicationPolicy(t *testing.T) {
 			wantErr: nil,
 		},
 		{
-			name: "err: not exists-different user",
+			name: "ok: not exists-different user",
 			before: before{
 				mainStorage: "main",
 				bucketRepl: &entity.BucketReplicationPolicy{
@@ -687,10 +786,10 @@ func Test_DeleteBucketReplicationPolicy(t *testing.T) {
 				FromBucket:  "bucket",
 				ToBucket:    "bucket",
 			},
-			wantErr: dom.ErrNotFound,
+			missing: true,
 		},
 		{
-			name: "err: not exists-different from storage",
+			name: "ok: not exists-different from storage",
 			before: before{
 				mainStorage: "main",
 				bucketRepl: &entity.BucketReplicationPolicy{
@@ -707,10 +806,10 @@ func Test_DeleteBucketReplicationPolicy(t *testing.T) {
 				FromBucket:  "bucket",
 				ToBucket:    "bucket",
 			},
-			wantErr: dom.ErrNotFound,
+			missing: true,
 		},
 		{
-			name: "err: not exists-different to storage",
+			name: "ok: not exists-different to storage",
 			before: before{
 				mainStorage: "main",
 				bucketRepl: &entity.BucketReplicationPolicy{
@@ -727,10 +826,10 @@ func Test_DeleteBucketReplicationPolicy(t *testing.T) {
 				FromBucket:  "bucket",
 				ToBucket:    "bucket",
 			},
-			wantErr: dom.ErrNotFound,
+			missing: true,
 		},
 		{
-			name: "err: not exists-different from bucket",
+			name: "ok: not exists-different from bucket",
 			before: before{
 				mainStorage: "main",
 				bucketRepl: &entity.BucketReplicationPolicy{
@@ -747,10 +846,10 @@ func Test_DeleteBucketReplicationPolicy(t *testing.T) {
 				FromBucket:  "bucket-2",
 				ToBucket:    "bucket",
 			},
-			wantErr: dom.ErrNotFound,
+			missing: true,
 		},
 		{
-			name: "err: not exists-different to bucket",
+			name: "ok: not exists-different to bucket",
 			before: before{
 				mainStorage: "main",
 				bucketRepl: &entity.BucketReplicationPolicy{
@@ -767,7 +866,7 @@ func Test_DeleteBucketReplicationPolicy(t *testing.T) {
 				FromBucket:  "bucket",
 				ToBucket:    "bucket-2",
 			},
-			wantErr: dom.ErrNotFound,
+			missing: true,
 		},
 		{
 			name: "err: has switch",
@@ -833,7 +932,7 @@ func Test_DeleteBucketReplicationPolicy(t *testing.T) {
 			ctx := t.Context()
 
 			if tt.before.userRepl != nil {
-				err := svc.AddUserReplicationPolicy(ctx, *tt.before.userRepl, entity.ReplicationOptions{})
+				_, err := svc.AddUserReplicationPolicy(ctx, *tt.before.userRepl, entity.ReplicationOptions{})
 				r.NoError(err)
 				if tt.before.userReplHasSwitch {
 					uid := entity.UniversalFromUserReplication(*tt.before.userRepl)
@@ -842,7 +941,7 @@ func Test_DeleteBucketReplicationPolicy(t *testing.T) {
 				}
 			}
 			if tt.before.bucketRepl != nil {
-				err := svc.AddBucketReplicationPolicy(ctx, *tt.before.bucketRepl, entity.ReplicationOptions{})
+				_, err := svc.AddBucketReplicationPolicy(ctx, *tt.before.bucketRepl, entity.ReplicationOptions{})
 				r.NoError(err)
 				if tt.before.bucketReplHasSwitch {
 					bid := entity.UniversalFromBucketReplication(*tt.before.bucketRepl)
@@ -851,15 +950,26 @@ func Test_DeleteBucketReplicationPolicy(t *testing.T) {
 				}
 			}
 
+			uid := entity.UniversalFromBucketReplication(tt.policy)
+			if tt.missing {
+				for _, q := range tasks.AllReplicationQueues(uid) {
+					qs.Queues[q] = 1
+				}
+			}
 			err := svc.DeleteBucketReplication(ctx, tt.policy)
 			if tt.wantErr != nil {
 				r.ErrorIs(err, tt.wantErr)
 				return
 			}
 			r.NoError(err)
+			if tt.missing {
+				r.Empty(qs.Queues, "delete of missing replication removes its leftover queues")
+				_, err = svc.GetReplicationPolicyInfoExtended(ctx, entity.UniversalFromBucketReplication(*tt.before.bucketRepl))
+				r.NoError(err, "existing replication is not affected")
+				return
+			}
 
 			// check if deleted
-			uid := entity.UniversalFromBucketReplication(tt.policy)
 			_, err = svc.GetReplicationPolicyInfoExtended(ctx, uid)
 			r.ErrorIs(err, dom.ErrNotFound)
 
@@ -869,7 +979,7 @@ func Test_DeleteBucketReplicationPolicy(t *testing.T) {
 				r.NoError(err)
 			}
 			// can recreate
-			err = svc.AddBucketReplicationPolicy(ctx, tt.policy, entity.ReplicationOptions{})
+			_, err = svc.AddBucketReplicationPolicy(ctx, tt.policy, entity.ReplicationOptions{})
 			r.NoError(err)
 			// check if added
 			uid = entity.UniversalFromBucketReplication(tt.policy)
@@ -893,6 +1003,7 @@ func Test_DeleteUserReplicationPolicy(t *testing.T) {
 		before  before
 		policy  entity.UserReplicationPolicy
 		wantErr error
+		missing bool
 	}{
 		{
 			name: "ok",
@@ -911,7 +1022,7 @@ func Test_DeleteUserReplicationPolicy(t *testing.T) {
 			wantErr: nil,
 		},
 		{
-			name: "err: not exists-different user",
+			name: "ok: not exists-different user",
 			before: before{
 				mainStorage: "main",
 				userRepl: &entity.UserReplicationPolicy{
@@ -924,10 +1035,10 @@ func Test_DeleteUserReplicationPolicy(t *testing.T) {
 				FromStorage: "main",
 				ToStorage:   "follower",
 			},
-			wantErr: dom.ErrNotFound,
+			missing: true,
 		},
 		{
-			name: "err: not exists-different from storage",
+			name: "ok: not exists-different from storage",
 			before: before{
 				mainStorage: "main",
 				userRepl: &entity.UserReplicationPolicy{
@@ -940,10 +1051,10 @@ func Test_DeleteUserReplicationPolicy(t *testing.T) {
 				FromStorage: "main-2",
 				ToStorage:   "follower",
 			},
-			wantErr: dom.ErrNotFound,
+			missing: true,
 		},
 		{
-			name: "err: not exists-different to storage",
+			name: "ok: not exists-different to storage",
 			before: before{
 				mainStorage: "main",
 				userRepl: &entity.UserReplicationPolicy{
@@ -956,7 +1067,7 @@ func Test_DeleteUserReplicationPolicy(t *testing.T) {
 				FromStorage: "main",
 				ToStorage:   "follower-2",
 			},
-			wantErr: dom.ErrNotFound,
+			missing: true,
 		},
 		{
 			name: "err: has switch",
@@ -1016,7 +1127,7 @@ func Test_DeleteUserReplicationPolicy(t *testing.T) {
 			ctx := t.Context()
 
 			if tt.before.userRepl != nil {
-				err := svc.AddUserReplicationPolicy(ctx, *tt.before.userRepl, entity.ReplicationOptions{})
+				_, err := svc.AddUserReplicationPolicy(ctx, *tt.before.userRepl, entity.ReplicationOptions{})
 				r.NoError(err)
 				if tt.before.userReplHasSwitch {
 					uid := entity.UniversalFromUserReplication(*tt.before.userRepl)
@@ -1025,7 +1136,7 @@ func Test_DeleteUserReplicationPolicy(t *testing.T) {
 				}
 			}
 			if tt.before.bucketRepl != nil {
-				err := svc.AddBucketReplicationPolicy(ctx, *tt.before.bucketRepl, entity.ReplicationOptions{})
+				_, err := svc.AddBucketReplicationPolicy(ctx, *tt.before.bucketRepl, entity.ReplicationOptions{})
 				r.NoError(err)
 				if tt.before.bucketReplHasSwitch {
 					bid := entity.UniversalFromBucketReplication(*tt.before.bucketRepl)
@@ -1034,15 +1145,26 @@ func Test_DeleteUserReplicationPolicy(t *testing.T) {
 				}
 			}
 
+			uid := entity.UniversalFromUserReplication(tt.policy)
+			if tt.missing {
+				for _, q := range tasks.AllReplicationQueues(uid) {
+					qs.Queues[q] = 1
+				}
+			}
 			err := svc.DeleteUserReplication(ctx, tt.policy)
 			if tt.wantErr != nil {
 				r.ErrorIs(err, tt.wantErr)
 				return
 			}
 			r.NoError(err)
+			if tt.missing {
+				r.Empty(qs.Queues, "delete of missing replication removes its leftover queues")
+				_, err = svc.GetReplicationPolicyInfoExtended(ctx, entity.UniversalFromUserReplication(*tt.before.userRepl))
+				r.NoError(err, "existing replication is not affected")
+				return
+			}
 
 			// check if deleted
-			uid := entity.UniversalFromUserReplication(tt.policy)
 			_, err = svc.GetReplicationPolicyInfoExtended(ctx, uid)
 			r.ErrorIs(err, dom.ErrNotFound)
 
@@ -1052,7 +1174,7 @@ func Test_DeleteUserReplicationPolicy(t *testing.T) {
 				r.NoError(err)
 			}
 			// can recreate
-			err = svc.AddUserReplicationPolicy(ctx, tt.policy, entity.ReplicationOptions{})
+			_, err = svc.AddUserReplicationPolicy(ctx, tt.policy, entity.ReplicationOptions{})
 			r.NoError(err)
 			// check if added
 			uid = entity.UniversalFromUserReplication(tt.policy)
@@ -1064,4 +1186,167 @@ func Test_DeleteUserReplicationPolicy(t *testing.T) {
 
 func uidPtr(u entity.UniversalReplicationID) *entity.UniversalReplicationID {
 	return &u
+}
+
+func Test_ReplicationGeneration(t *testing.T) {
+	c := testutil.SetupRedis(t)
+	userPolicy := entity.UserReplicationPolicy{
+		User:        "user",
+		FromStorage: "main",
+		ToStorage:   "follower",
+	}
+	bucketPolicy := entity.BucketReplicationPolicy{
+		User:        "user",
+		FromStorage: "main",
+		ToStorage:   "follower",
+		FromBucket:  "bucket",
+		ToBucket:    "bucket",
+	}
+	tests := []struct {
+		name    string
+		id      entity.UniversalReplicationID
+		otherID entity.UniversalReplicationID
+		add     func(svc *policySvc) (int64, error)
+		delete  func(svc *policySvc) error
+	}{
+		{
+			name: "user replication",
+			add: func(svc *policySvc) (int64, error) {
+				return svc.AddUserReplicationPolicy(t.Context(), userPolicy, entity.ReplicationOptions{})
+			},
+			delete: func(svc *policySvc) error {
+				return svc.DeleteUserReplication(t.Context(), userPolicy)
+			},
+			id:      entity.UniversalFromUserReplication(userPolicy),
+			otherID: entity.UniversalFromBucketReplication(bucketPolicy),
+		},
+		{
+			name: "bucket replication",
+			add: func(svc *policySvc) (int64, error) {
+				return svc.AddBucketReplicationPolicy(t.Context(), bucketPolicy, entity.ReplicationOptions{})
+			},
+			delete: func(svc *policySvc) error {
+				return svc.DeleteBucketReplication(t.Context(), bucketPolicy)
+			},
+			id:      entity.UniversalFromBucketReplication(bucketPolicy),
+			otherID: entity.UniversalFromUserReplication(userPolicy),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := c.FlushAll(t.Context()).Err(); err != nil {
+				t.Fatal(err)
+			}
+			qs := tasks.QueueServiceMock{
+				Queues: map[string]int{},
+				Paused: map[string]bool{},
+			}
+			r := require.New(t)
+			svc := NewService(c, &qs, "main")
+			ctx := t.Context()
+
+			gen, err := svc.GetReplicationGeneration(ctx, tt.id)
+			r.NoError(err)
+			r.Zero(gen, "generation of never created replication")
+
+			created, err := tt.add(svc)
+			r.NoError(err)
+			r.EqualValues(1, created)
+			gen, err = svc.GetReplicationGeneration(ctx, tt.id)
+			r.NoError(err)
+			r.Equal(created, gen)
+
+			proxyCtx, err := svc.BuildProxyContext(ctx, "user", "bucket")
+			r.NoError(err)
+			r.Equal(created, xctx.GetReplicationGeneration(proxyCtx, tt.id), "proxy uses generation of active replication")
+
+			_, err = tt.add(svc)
+			r.ErrorIs(err, dom.ErrAlreadyExists)
+			gen, err = svc.GetReplicationGeneration(ctx, tt.id)
+			r.NoError(err)
+			r.Equal(created, gen, "failed add does not change generation")
+
+			for _, q := range tasks.AllReplicationQueues(tt.id) {
+				qs.Queues[q] = 1
+			}
+			r.NoError(tt.delete(svc))
+			gen, err = svc.GetReplicationGeneration(ctx, tt.id)
+			r.NoError(err)
+			r.Greater(gen, created, "delete starts new generation")
+			r.Empty(qs.Queues, "delete removes replication queues")
+
+			deleted := gen
+			for _, q := range tasks.AllReplicationQueues(tt.id) {
+				qs.Queues[q] = 1
+			}
+			r.NoError(tt.delete(svc), "delete of missing replication succeeds")
+			gen, err = svc.GetReplicationGeneration(ctx, tt.id)
+			r.NoError(err)
+			r.Equal(deleted, gen, "delete of missing replication does not change generation")
+			r.Empty(qs.Queues, "delete of missing replication removes leftover queues")
+
+			recreated, err := tt.add(svc)
+			r.NoError(err)
+			r.Greater(recreated, deleted, "recreated replication gets new generation")
+
+			gen, err = svc.GetReplicationGeneration(ctx, tt.otherID)
+			r.NoError(err)
+			r.Zero(gen, "other replication of the same user and storages is not affected")
+		})
+	}
+}
+
+func Test_DeleteReplication_ZeroDowntimeSwitchInProgress(t *testing.T) {
+	userPolicy := entity.UserReplicationPolicy{User: "user", FromStorage: "main", ToStorage: "follower"}
+	bucketPolicy := entity.BucketReplicationPolicy{User: "user", FromStorage: "main", ToStorage: "follower", FromBucket: "bucket", ToBucket: "bucket"}
+	tests := []struct {
+		add    func(svc *policySvc) error
+		delete func(svc *policySvc) error
+		name   string
+		id     entity.UniversalReplicationID
+	}{
+		{
+			name: "user replication",
+			id:   entity.UniversalFromUserReplication(userPolicy),
+			add: func(svc *policySvc) error {
+				_, err := svc.AddUserReplicationPolicy(t.Context(), userPolicy, entity.ReplicationOptions{})
+				return err
+			},
+			delete: func(svc *policySvc) error {
+				return svc.DeleteUserReplication(t.Context(), userPolicy)
+			},
+		},
+		{
+			name: "bucket replication",
+			id:   entity.UniversalFromBucketReplication(bucketPolicy),
+			add: func(svc *policySvc) error {
+				_, err := svc.AddBucketReplicationPolicy(t.Context(), bucketPolicy, entity.ReplicationOptions{})
+				return err
+			},
+			delete: func(svc *policySvc) error {
+				return svc.DeleteBucketReplication(t.Context(), bucketPolicy)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := require.New(t)
+			c := testutil.SetupRedis(t)
+			qs := &tasks.QueueServiceMock{
+				Queues: map[string]int{},
+				Paused: map[string]bool{},
+			}
+			svc := NewService(c, qs, "main")
+			r.NoError(tt.add(svc))
+			startZeroDowntimeSwitch(t, svc, qs, tt.id)
+			for _, q := range tasks.AllReplicationQueues(tt.id) {
+				qs.Queues[q] = 1
+			}
+
+			r.ErrorIs(tt.delete(svc), dom.ErrInvalidArg)
+			for _, q := range tasks.AllReplicationQueues(tt.id) {
+				r.Contains(qs.Queues, q, "queues of replication in switch are not purged")
+			}
+		})
+	}
 }

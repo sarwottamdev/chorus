@@ -28,9 +28,9 @@ import (
 )
 
 func WrapS3common(client s3client.Client) Common {
-	return &s3CommonClient{
+	return commonClient{&s3CommonClient{
 		client: client,
-	}
+	}}
 }
 
 type s3CommonClient struct {
@@ -117,11 +117,12 @@ func (s *s3CommonClient) ListObjects(ctx context.Context, bucket string, opts ..
 				return
 			}
 			info := CommonObjectInfo{
-				Key:          object.Key,
-				VersionID:    object.VersionID,
-				LastModified: object.LastModified,
-				Etag:         object.ETag,
-				Size:         uint64(object.Size),
+				Key:            object.Key,
+				VersionID:      object.VersionID,
+				LastModified:   object.LastModified,
+				Etag:           object.ETag,
+				Size:           uint64(object.Size),
+				IsDeleteMarker: object.IsDeleteMarker,
 			}
 			if !yield(info, nil) {
 				return

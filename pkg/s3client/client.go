@@ -68,6 +68,9 @@ func NewClient(ctx context.Context, metricsSvc metrics.Service, storageConf s3.S
 	mc, err := mclient.New(host, &mclient.Options{
 		Creds:  credentials.NewStaticV4(c.cred.AccessKeyID, c.cred.SecretAccessKey, ""),
 		Secure: storageConf.IsSecure,
+		// Without a region minio looks it up with GetBucketLocation signed with us-east-1,
+		// which providers validating the credential scope reject. Empty keeps the lookup.
+		Region: storageConf.DefaultRegion,
 	})
 	if err != nil {
 		return nil, err
@@ -105,16 +108,23 @@ func NewClient(ctx context.Context, metricsSvc metrics.Service, storageConf s3.S
 }
 
 func isOnline(ctx context.Context, c *client) error {
-	_, err := c.mc.GetBucketLocation(ctx, "probe-health-test")
-	if err == nil {
-		return nil
-	} else if !mclient.IsNetworkOrHostDown(err, false) {
-		switch mclient.ToErrorResponse(err).Code {
-		case "NoSuchBucket", "AccessDenied", "":
-			return nil
-		}
+	// Not GetBucketLocation: with a configured region minio-go answers it without a request.
+	_, err := c.mc.GetBucketVersioning(ctx, "probe-health-test")
+	if err == nil || mclient.IsNetworkOrHostDown(err, false) {
+		return err
 	}
-	return err
+	errResp := mclient.ToErrorResponse(err)
+	if errResp.StatusCode == http.StatusBadGateway {
+		// gateway in front of the storage cannot reach it
+		return err
+	}
+	switch errResp.Code {
+	case "", "InvalidAccessKeyId", "SignatureDoesNotMatch", "AuthorizationHeaderMalformed":
+		// not an S3 error response, or the storage rejected the credentials
+		return err
+	}
+	// any other S3 error response (NoSuchBucket, AccessDenied, NotImplemented, ...) means the storage is up
+	return nil
 }
 
 func (c *client) SNS() *sns.Client {
